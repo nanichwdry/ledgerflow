@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    env:
+      # Build-time-only placeholders — real secrets live in your deploy
+      # platform's env vars, never committed here. The build never touches a
+      # live database (Prisma generate just reads schema.prisma), and the
+      # dynamic, cookie-based pages skip static generation, so these only
+      # need to be non-empty strings for the build to succeed mechanically.
+      NEXT_PUBLIC_SUPABASE_URL: https://placeholder.supabase.co
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: placeholder-anon-key-placeholder-anon-key
+      NEXT_PUBLIC_APP_URL: https://placeholder.example.com
+      DATABASE_URL: postgresql://user:pass@localhost:5432/placeholder
+      DIRECT_URL: postgresql://user:pass@localhost:5432/placeholder
+      PLAID_CLIENT_ID: placeholder
+      PLAID_SECRET: placeholder
+      PLAID_ENV: sandbox
+      PLAID_TOKEN_ENCRYPTION_KEY: '0000000000000000000000000000000000000000000000000000000000000000'
+      ANTHROPIC_API_KEY: placeholder
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - run: npm ci
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Type-check
+        run: npm run typecheck
+
+      - name: Lint
+        run: npx next lint
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Build
+        run: npm run build

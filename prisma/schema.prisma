@@ -1,0 +1,763 @@
+// LedgerFlow — double-entry bookkeeping schema with Plaid sync
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ---------- Identity ----------
+
+// One row per Supabase auth user. Everything in the app hangs off Organization.
+model Organization {
+  id        String   @id @default(cuid())
+  name      String
+  ownerId   String   @unique // Supabase auth.users.id
+  currency  String   @default("USD")
+  createdAt DateTime @default(now())
+
+  accounts           Account[]
+  journalEntries     JournalEntry[]
+  plaidItems         PlaidItem[]
+  categorizationRules CategorizationRule[]
+  customers          Customer[]
+  vendors            Vendor[]
+  invoices           Invoice[]
+  bills              Bill[]
+  inventoryItems     InventoryItem[]
+  receipts           Receipt[]
+  integrations       Integration[]
+  memberships        Membership[]
+  auditLogs          AuditLog[]
+  reconciliations    Reconciliation[]
+  classes            Class[]
+  budgets            Budget[]
+  payrollRuns        PayrollRun[]
+  taxRates           TaxRate[]
+}
+
+// ---------- Chart of Accounts ----------
+
+enum AccountType {
+  ASSET
+  LIABILITY
+  EQUITY
+  REVENUE
+  EXPENSE
+}
+
+enum NormalBalance {
+  DEBIT
+  CREDIT
+}
+
+model Account {
+  id            String        @id @default(cuid())
+  organizationId String
+  organization  Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  code          String        // e.g. "1010" Checking, "6020" Office Supplies
+  name          String
+  type          AccountType
+  normalBalance NormalBalance
+  isBankFeed    Boolean       @default(false) // true for accounts linked to a live Plaid feed
+  isCashAccount Boolean       @default(false) // included in the Cash Flow Statement's cash pool
+  archived      Boolean       @default(false)
+
+  parentId      String?
+  parent        Account?      @relation("AccountHierarchy", fields: [parentId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  children      Account[]     @relation("AccountHierarchy")
+
+  journalLines      JournalLine[]
+  plaidAccount      PlaidAccount?
+  categorizationRules CategorizationRule[]
+  categorizedTransactions PlaidTransaction[] @relation("CategorizedAccount")
+  invoiceRevenueLines     InvoiceLine[]      @relation("InvoiceRevenueLines")
+  invoicePaymentDeposits  InvoicePayment[]   @relation("InvoicePaymentDeposits")
+  billExpenseLines        BillLine[]         @relation("BillExpenseLines")
+  billPaymentSources      BillPayment[]      @relation("BillPaymentSources")
+  inventoryItemsAsAsset   InventoryItem[]    @relation("InventoryAssetAccount")
+  inventoryItemsAsCogs    InventoryItem[]    @relation("InventoryCogsAccount")
+  budgetLines             BudgetLine[]       @relation("BudgetLines")
+  reconciliations         Reconciliation[]   @relation("AccountReconciliations")
+  payrollPaidFrom         PayrollRun[]       @relation("PayrollPaidFrom")
+  payrollWagesExpenseFor  PayrollRun[]       @relation("PayrollWagesExpense")
+  payrollTaxExpenseFor    PayrollRun[]       @relation("PayrollTaxExpense")
+  payrollLiabilitiesFor   PayrollRun[]       @relation("PayrollLiabilities")
+
+  createdAt DateTime @default(now())
+
+  @@unique([organizationId, code])
+  @@index([organizationId, type])
+}
+
+// ---------- General Ledger ----------
+
+enum JournalSource {
+  MANUAL
+  PLAID_SYNC
+  OPENING_BALANCE
+  INVOICE_SEND
+  INVOICE_PAYMENT
+  BILL_ENTRY
+  BILL_PAYMENT
+  PAYROLL
+}
+
+model JournalEntry {
+  id             String        @id @default(cuid())
+  organizationId String
+  organization   Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  date           DateTime
+  memo           String
+  source         JournalSource @default(MANUAL)
+
+  // When source = PLAID_SYNC, links back to the originating Plaid transaction (1:1)
+  plaidTransaction PlaidTransaction?
+
+  // Reverse sides of the AR/AP posting links below — at most one is ever set.
+  invoiceSentBy    Invoice?      @relation("InvoiceSendEntry")
+  invoicePaidBy    InvoicePayment? @relation("InvoicePaymentEntry")
+  billEnteredBy    Bill?         @relation("BillEntryEntry")
+  billPaidBy       BillPayment?  @relation("BillPaymentEntry")
+  payrollRunFor    PayrollRun?   @relation("PayrollEntry")
+
+  lines          JournalLine[]
+
+  createdAt DateTime @default(now())
+
+  @@index([organizationId, date])
+}
+
+model JournalLine {
+  id             String       @id @default(cuid())
+  journalEntryId String
+  journalEntry   JournalEntry @relation(fields: [journalEntryId], references: [id], onDelete: Cascade)
+
+  accountId String
+  account   Account @relation(fields: [accountId], references: [id])
+
+  // Stored in minor units (cents) to avoid float drift. Exactly one of debit/credit is > 0.
+  debitCents  Int @default(0)
+  creditCents Int @default(0)
+
+  description String?
+
+  // Set once this line has been matched against a bank statement and locked
+  // from further editing (see Reconciliation below).
+  reconciliationId String?
+  reconciliation    Reconciliation? @relation(fields: [reconciliationId], references: [id])
+
+  // Optional department/location dimension for class-tracked reporting.
+  classId String?
+  class   Class? @relation(fields: [classId], references: [id])
+
+  @@index([accountId])
+  @@index([journalEntryId])
+  @@index([reconciliationId])
+}
+
+// ---------- Plaid ----------
+
+enum PlaidItemStatus {
+  ACTIVE
+  ERROR
+  REAUTH_REQUIRED
+}
+
+model PlaidItem {
+  id             String        @id @default(cuid())
+  organizationId String
+  organization   Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  plaidItemId   String          @unique
+  accessToken   String          // encrypted at rest by lib/plaid.ts before write
+  institutionId String?
+  institutionName String?
+  status        PlaidItemStatus @default(ACTIVE)
+  cursor        String?         // transactions/sync cursor for incremental updates
+
+  accounts PlaidAccount[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model PlaidAccount {
+  id          String   @id @default(cuid())
+  plaidItemId String
+  plaidItem   PlaidItem @relation(fields: [plaidItemId], references: [id], onDelete: Cascade)
+
+  plaidAccountId String  @unique
+  name           String
+  mask           String?
+  type           String  // depository, credit, loan, ...
+  subtype        String?
+
+  // The GL account this bank feed posts into (e.g. "Checking ••1234")
+  linkedAccountId String  @unique
+  linkedAccount   Account @relation(fields: [linkedAccountId], references: [id])
+
+  transactions PlaidTransaction[]
+
+  createdAt DateTime @default(now())
+}
+
+model PlaidTransaction {
+  id             String   @id @default(cuid())
+  plaidAccountId String
+  plaidAccount   PlaidAccount @relation(fields: [plaidAccountId], references: [id], onDelete: Cascade)
+
+  plaidTransactionId String  @unique
+  amountCents         Int     // Plaid sign convention: positive = money out of the account
+  isoCurrencyCode     String  @default("USD")
+  date                DateTime
+  name                String
+  merchantName        String?
+  pending             Boolean @default(false)
+  personalFinanceCategory String? // Plaid's detailed category, used for auto-categorization
+
+  // Set once this transaction has been posted to the GL
+  journalEntryId String?       @unique
+  journalEntry   JournalEntry? @relation(fields: [journalEntryId], references: [id])
+
+  // The GL account it was categorized to (the "other side" of the bank entry)
+  categorizedAccountId String?
+  categorizedAccount   Account? @relation("CategorizedAccount", fields: [categorizedAccountId], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@index([plaidAccountId, date])
+}
+
+// ---------- Auto-categorization ----------
+
+enum RuleMatchType {
+  MERCHANT_CONTAINS
+  NAME_CONTAINS
+  PLAID_CATEGORY
+}
+
+model CategorizationRule {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  matchType  RuleMatchType
+  matchValue String
+  priority   Int           @default(100) // lower runs first
+
+  accountId String
+  account   Account @relation(fields: [accountId], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@index([organizationId, priority])
+}
+
+// ---------- Accounts Receivable ----------
+
+model Customer {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  name    String
+  email   String?
+  phone   String?
+  address String?
+  region  String? // free-text state/region, used to suggest a matching TaxRate
+
+  invoices  Invoice[]
+  createdAt DateTime  @default(now())
+  archived  Boolean   @default(false)
+
+  @@index([organizationId])
+}
+
+enum InvoiceStatus {
+  DRAFT
+  SENT
+  PARTIALLY_PAID
+  PAID
+  VOID
+}
+
+model Invoice {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id])
+
+  number      Int // sequential per organization, assigned on creation
+  issueDate   DateTime
+  dueDate     DateTime
+  status      InvoiceStatus @default(DRAFT)
+  notes       String?
+
+  subtotalCents Int
+  taxCents      Int @default(0)
+  totalCents    Int
+  amountPaidCents Int @default(0)
+
+  // The named TaxRate selected for this invoice, if any (vs. an ad-hoc percent)
+  taxRateId String?
+  taxRate   TaxRate? @relation(fields: [taxRateId], references: [id])
+
+  // Random, unguessable token used in the public /invoice/[id] view+pay link —
+  // deliberately separate from the database id so links can be shared safely.
+  publicToken String @unique @default(uuid())
+
+  // The accrual entry posted when the invoice is sent (Debit AR, Credit Revenue/Tax, +COGS if inventory involved)
+  sendJournalEntryId String?      @unique
+  sendJournalEntry   JournalEntry? @relation("InvoiceSendEntry", fields: [sendJournalEntryId], references: [id])
+
+  stripePaymentLinkUrl   String?
+  stripePaymentLinkId    String?
+
+  lastEmailedAt DateTime?
+
+  lines    InvoiceLine[]
+  payments InvoicePayment[]
+
+  createdAt DateTime @default(now())
+
+  @@unique([organizationId, number])
+  @@index([organizationId, status])
+}
+
+model InvoiceLine {
+  id        String  @id @default(cuid())
+  invoiceId String
+  invoice   Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  description String
+  quantity    Float  @default(1)
+  unitPriceCents Int
+  amountCents Int // quantity * unitPriceCents, stored to avoid recompute drift
+
+  // Revenue account credited for this line (defaults to Sales Revenue)
+  revenueAccountId String
+  revenueAccount   Account @relation("InvoiceRevenueLines", fields: [revenueAccountId], references: [id])
+
+  // Set if this line draws down tracked inventory (drives COGS + stock decrement)
+  inventoryItemId String?
+  inventoryItem   InventoryItem? @relation(fields: [inventoryItemId], references: [id])
+
+  // Optional department/location dimension, carried through to the posted journal lines.
+  classId String?
+  class   Class? @relation("InvoiceLineClass", fields: [classId], references: [id])
+}
+
+model InvoicePayment {
+  id        String  @id @default(cuid())
+  invoiceId String
+  invoice   Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  amountCents Int
+  date        DateTime
+  method      String // "manual", "stripe"
+
+  // Set for Stripe-sourced payments — Stripe's event.id, used so a retried
+  // webhook delivery can never post the same payment twice.
+  stripeEventId String? @unique
+
+  depositAccountId String
+  depositAccount   Account @relation("InvoicePaymentDeposits", fields: [depositAccountId], references: [id])
+
+  journalEntryId String       @unique
+  journalEntry   JournalEntry @relation("InvoicePaymentEntry", fields: [journalEntryId], references: [id])
+
+  createdAt DateTime @default(now())
+}
+
+// ---------- Accounts Payable ----------
+
+model Vendor {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  name    String
+  email   String?
+  phone   String?
+  address String?
+
+  bills     Bill[]
+  createdAt DateTime @default(now())
+  archived  Boolean  @default(false)
+
+  @@index([organizationId])
+}
+
+enum BillStatus {
+  DRAFT // pre-filled from OCR, not yet confirmed/posted
+  OPEN
+  PARTIALLY_PAID
+  PAID
+  VOID
+}
+
+model Bill {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  vendorId String
+  vendor   Vendor @relation(fields: [vendorId], references: [id])
+
+  reference   String? // vendor's invoice/bill number, if any
+  billDate    DateTime
+  dueDate     DateTime
+  status      BillStatus @default(OPEN)
+  notes       String?
+
+  totalCents      Int
+  amountPaidCents Int @default(0)
+
+  // Entry posted once the bill leaves DRAFT (Debit Expense/Inventory lines, Credit AP)
+  entryJournalEntryId String?       @unique
+  entryJournalEntry   JournalEntry? @relation("BillEntryEntry", fields: [entryJournalEntryId], references: [id])
+
+  receipt   Receipt?
+
+  lines    BillLine[]
+  payments BillPayment[]
+
+  createdAt DateTime @default(now())
+
+  @@index([organizationId, status])
+}
+
+model BillLine {
+  id     String @id @default(cuid())
+  billId String
+  bill   Bill   @relation(fields: [billId], references: [id], onDelete: Cascade)
+
+  description String
+  quantity    Float @default(1)
+  unitCostCents Int
+  amountCents Int
+
+  // Expense account debited for this line — OR the inventory item's own
+  // inventory asset account when inventoryItemId is set (stock increases instead).
+  expenseAccountId String
+  expenseAccount   Account @relation("BillExpenseLines", fields: [expenseAccountId], references: [id])
+
+  inventoryItemId String?
+  inventoryItem   InventoryItem? @relation(fields: [inventoryItemId], references: [id])
+
+  // Optional department/location dimension, carried through to the posted journal lines.
+  classId String?
+  class   Class? @relation("BillLineClass", fields: [classId], references: [id])
+}
+
+model BillPayment {
+  id     String @id @default(cuid())
+  billId String
+  bill   Bill   @relation(fields: [billId], references: [id], onDelete: Cascade)
+
+  amountCents Int
+  date        DateTime
+
+  paidFromAccountId String
+  paidFromAccount   Account @relation("BillPaymentSources", fields: [paidFromAccountId], references: [id])
+
+  journalEntryId String       @unique
+  journalEntry   JournalEntry @relation("BillPaymentEntry", fields: [journalEntryId], references: [id])
+
+  createdAt DateTime @default(now())
+}
+
+// ---------- Inventory ----------
+
+model InventoryItem {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  sku  String
+  name String
+
+  quantityOnHand    Float @default(0)
+  averageCostCents  Int   @default(0) // weighted-average unit cost, updated on every purchase
+  defaultSaleCents  Int   @default(0)
+  reorderPoint      Float @default(0)
+
+  inventoryAccountId String
+  inventoryAccount   Account @relation("InventoryAssetAccount", fields: [inventoryAccountId], references: [id])
+
+  cogsAccountId String
+  cogsAccount   Account @relation("InventoryCogsAccount", fields: [cogsAccountId], references: [id])
+
+  invoiceLines InvoiceLine[]
+  billLines    BillLine[]
+
+  archived  Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@unique([organizationId, sku])
+  @@index([organizationId])
+}
+
+// ---------- Receipt capture (OCR) ----------
+
+enum ReceiptStatus {
+  PROCESSING
+  NEEDS_REVIEW
+  CONVERTED
+  FAILED
+}
+
+model Receipt {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  storagePath String // path within the Supabase Storage "receipts" bucket
+  status      ReceiptStatus @default(PROCESSING)
+
+  // Raw OCR extraction, kept for audit / re-review even after a Bill is created
+  extractedVendorName String?
+  extractedDate       DateTime?
+  extractedTotalCents Int?
+  extractedRaw        Json?
+
+  billId String?  @unique
+  bill   Bill?    @relation(fields: [billId], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@index([organizationId, status])
+}
+
+// ---------- Third-party integrations ----------
+
+enum IntegrationProvider {
+  STRIPE
+}
+
+enum IntegrationStatus {
+  CONNECTED
+  ERROR
+  DISCONNECTED
+}
+
+model Integration {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  provider    IntegrationProvider
+  status      IntegrationStatus  @default(CONNECTED)
+  credentials String // encrypted at rest by lib/crypto.ts (e.g. Stripe secret key)
+  metadata    Json?  // provider-specific extras (e.g. Stripe account id)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([organizationId, provider])
+}
+
+// ---------- Multi-user / roles ----------
+
+enum MembershipRole {
+  OWNER
+  ADMIN
+  ACCOUNTANT
+  EMPLOYEE
+}
+
+enum MembershipStatus {
+  INVITED
+  ACTIVE
+  REMOVED
+}
+
+model Membership {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  userId String? // Supabase auth.users.id — null until the invite is accepted
+  email  String // invited address; also matched against on first login
+
+  role   MembershipRole   @default(EMPLOYEE)
+  status MembershipStatus @default(INVITED)
+
+  invitedByUserId String?
+  invitedAt       DateTime  @default(now())
+  joinedAt        DateTime?
+
+  @@unique([organizationId, email])
+  @@index([userId])
+}
+
+// ---------- Audit trail ----------
+
+enum AuditAction {
+  CREATE
+  UPDATE
+  DELETE
+}
+
+model AuditLog {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  actorUserId String
+  actorEmail  String? // denormalized so history reads fine even after a member is removed
+
+  entityType String // e.g. "JournalEntry", "Invoice", "Account"
+  entityId   String
+  action     AuditAction
+
+  summary String // human-readable one-liner shown in the audit log UI
+  before  Json?
+  after   Json?
+
+  createdAt DateTime @default(now())
+
+  @@index([organizationId, createdAt])
+  @@index([organizationId, entityType, entityId])
+}
+
+// ---------- Bank reconciliation ----------
+
+enum ReconciliationStatus {
+  IN_PROGRESS
+  COMPLETED
+}
+
+model Reconciliation {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  accountId String
+  account   Account @relation("AccountReconciliations", fields: [accountId], references: [id])
+
+  statementDate       DateTime
+  statementEndingCents Int
+  status              ReconciliationStatus @default(IN_PROGRESS)
+  completedAt         DateTime?
+
+  lines JournalLine[]
+
+  createdAt DateTime @default(now())
+
+  @@index([organizationId, accountId])
+}
+
+// ---------- Class / location tracking ----------
+
+model Class {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  name     String
+  archived Boolean @default(false)
+
+  journalLines JournalLine[]
+  invoiceLines InvoiceLine[] @relation("InvoiceLineClass")
+  billLines    BillLine[]    @relation("BillLineClass")
+
+  createdAt DateTime @default(now())
+
+  @@unique([organizationId, name])
+}
+
+// ---------- Budgets ----------
+
+model Budget {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  name String // e.g. "FY2026 Operating Budget"
+  year Int
+
+  lines BudgetLine[]
+
+  createdAt DateTime @default(now())
+
+  @@unique([organizationId, year, name])
+}
+
+model BudgetLine {
+  id       String @id @default(cuid())
+  budgetId String
+  budget   Budget @relation(fields: [budgetId], references: [id], onDelete: Cascade)
+
+  accountId String
+  account   Account @relation("BudgetLines", fields: [accountId], references: [id])
+
+  month       Int // 1-12
+  amountCents Int
+
+  @@unique([budgetId, accountId, month])
+}
+
+// ---------- Payroll (journal posting only — no tax computation; see README) ----------
+
+model PayrollRun {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  payDate     DateTime
+  periodStart DateTime
+  periodEnd   DateTime
+  notes       String?
+
+  grossWagesCents      Int
+  employerTaxesCents   Int @default(0)
+  otherDeductionsCents Int @default(0)
+  netPayCents          Int
+
+  paidFromAccountId String
+  paidFromAccount   Account @relation("PayrollPaidFrom", fields: [paidFromAccountId], references: [id])
+
+  wagesExpenseAccountId String
+  wagesExpenseAccount   Account @relation("PayrollWagesExpense", fields: [wagesExpenseAccountId], references: [id])
+
+  taxExpenseAccountId String?
+  taxExpenseAccount   Account? @relation("PayrollTaxExpense", fields: [taxExpenseAccountId], references: [id])
+
+  liabilitiesAccountId String?
+  liabilitiesAccount   Account? @relation("PayrollLiabilities", fields: [liabilitiesAccountId], references: [id])
+
+  journalEntryId String?       @unique
+  journalEntry   JournalEntry? @relation("PayrollEntry", fields: [journalEntryId], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@index([organizationId, payDate])
+}
+
+// ---------- Sales tax rates (manually maintained, multi-jurisdiction) ----------
+
+model TaxRate {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  name        String // e.g. "California 7.25%"
+  region      String? // free-text state/region, matched against Customer.region for auto-suggest
+  ratePercent Float
+  archived    Boolean @default(false)
+
+  invoices Invoice[]
+
+  createdAt DateTime @default(now())
+
+  @@unique([organizationId, name])
+}
