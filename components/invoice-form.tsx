@@ -57,6 +57,30 @@ export function InvoiceForm({
   const [lines, setLines] = useState<Line[]>([emptyLine(defaultRevenueAccountId)]);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [suggestingTax, setSuggestingTax] = useState(false);
+
+  async function handleSuggestTax() {
+    if (!customerId) return;
+    setSuggestingTax(true);
+    try {
+      const res = await fetch(`/api/invoices/suggest-tax?customerId=${customerId}`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.ratePercent !== undefined) {
+          setTaxRate(data.ratePercent.toString());
+          setTaxRateId('');
+          if (data.rateName && !notes) {
+            setNotes(`Tax suggestion: ${data.rateName}`);
+          }
+        }
+      }
+    } catch (err) {
+      console.error('Suggest tax error', err);
+    } finally {
+      setSuggestingTax(false);
+    }
+  }
+
 
   const subtotalCents = useMemo(
     () =>
@@ -229,7 +253,7 @@ export function InvoiceForm({
           <label className="mb-1 block text-xs uppercase tracking-wider text-ink-soft">
             Tax rate
           </label>
-          <div className="flex gap-2">
+          <div className="flex gap-2 items-center">
             <Select
               value={taxRateId}
               onChange={(e) => {
@@ -258,6 +282,15 @@ export function InvoiceForm({
               }}
               className="w-24"
             />
+            <Button
+              type="button"
+              variant="secondary"
+              disabled={!customerId || suggestingTax}
+              onClick={handleSuggestTax}
+              className="text-xs shrink-0"
+            >
+              {suggestingTax ? 'Suggesting…' : '🤖 Auto-suggest'}
+            </Button>
           </div>
         </div>
         <div>

@@ -1,8 +1,4 @@
-import Anthropic from '@anthropic-ai/sdk';
 import { IS_MOCK_MODE } from '@/lib/env';
-
-const apiKey = process.env.ANTHROPIC_API_KEY;
-const client = apiKey && apiKey !== 'your-anthropic-api-key' ? new Anthropic({ apiKey }) : null;
 
 export type ExtractedReceipt = {
   vendorName: string | null;
@@ -11,21 +7,22 @@ export type ExtractedReceipt = {
   lineItems: { description: string; amountCents: number }[];
 };
 
-
 const EXTRACTION_PROMPT = `You are reading a photographed business receipt. Extract:
 - vendorName: the merchant/business name
 - date: the transaction date in YYYY-MM-DD format (use your best reading; if no date is visible, use null)
 - totalCents: the final total amount paid, in integer cents
 - lineItems: an array of { description, amountCents } for each line item you can read (best effort — an empty array is fine if the receipt is a single lump total)
 
-Respond with ONLY a raw JSON object matching this shape, no markdown fences, no commentary:
+Respond with a JSON object matching this schema:
 {"vendorName": string|null, "date": string|null, "totalCents": number|null, "lineItems": [{"description": string, "amountCents": number}]}`;
 
 export async function extractReceiptData(
   imageBase64: string,
   mediaType: 'image/jpeg' | 'image/png' | 'image/webp'
 ): Promise<ExtractedReceipt> {
-  const isMock = IS_MOCK_MODE || !client;
+  const apiKey = process.env.GEMINI_API_KEY;
+  const isMock = IS_MOCK_MODE || !apiKey || apiKey === 'your-gemini-api-key';
+
   if (isMock) {
     return {
       vendorName: 'Mock Coffee Company',
@@ -38,29 +35,46 @@ export async function extractReceiptData(
     };
   }
 
-  const response = await client!.messages.create({
-    model: 'claude-haiku-4-5-20251001',
-    max_tokens: 1024,
-    messages: [
-      {
-        role: 'user',
-        content: [
-          { type: 'image', source: { type: 'base64', media_type: mediaType, data: imageBase64 } },
-          { type: 'text', text: EXTRACTION_PROMPT },
-        ],
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents: [
+        {
+          parts: [
+            {
+              inlineData: {
+                mimeType: mediaType,
+                data: imageBase64,
+              },
+            },
+            {
+              text: EXTRACTION_PROMPT,
+            },
+          ],
+        },
+      ],
+      generationConfig: {
+        responseMimeType: 'application/json',
       },
-    ],
+    }),
   });
 
-  const textBlock = response.content.find((b) => b.type === 'text');
-  if (!textBlock || textBlock.type !== 'text') {
-    throw new Error('Claude did not return a text response for receipt extraction.');
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Gemini API error (${response.status}): ${errorText}`);
   }
 
-  const cleaned = textBlock.text.replace(/```json|```/g, '').trim();
+  const responseJson = await response.json();
+  const text = responseJson?.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!text) {
+    throw new Error('Gemini API did not return text content.');
+  }
+
   try {
-    return JSON.parse(cleaned) as ExtractedReceipt;
+    return JSON.parse(text) as ExtractedReceipt;
   } catch {
-    throw new Error(`Could not parse receipt extraction as JSON: ${cleaned.slice(0, 200)}`);
+    throw new Error(`Could not parse Gemini response as JSON: ${text.slice(0, 200)}`);
   }
 }
